@@ -1,0 +1,275 @@
+#cloud-config
+
+---
+write-files:
+  - path: /etc/conf.d/nfs
+    permissions: '0644'
+    content: |
+      OPTS_RPC_MOUNTD=""
+  - path: /opt/bin/wupiao
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+      [ -n "$1" ] && \
+        until curl -o /dev/null -sIf http://${1}; do \
+          sleep 1 && echo .;
+        done;
+      exit $?
+
+  - path: /opt/bin/kubernetes-install.sh
+    owner: root
+    permissions: 0755
+    content: |
+      #! /usr/bin/bash
+      set -e
+
+      if [ ! -f /opt/bin/kubelet ]; then
+        echo "Kubenetes not installed - installing."
+
+        export K8S_VERSION=$(curl -sS https://storage.googleapis.com/kubernetes-release/release/stable.txt)
+
+        # Extract the Kubernetes binaries.
+        sudo wget -N -P /opt/bin http://storage.googleapis.com/kubernetes-release/release/${K8S_VERSION}/bin/linux/amd64/kubelet
+        sudo wget -N -P /opt/bin http://storage.googleapis.com/kubernetes-release/release/${K8S_VERSION}/bin/linux/amd64/kube-proxy
+        sudo chmod +x /opt/bin/kubelet /opt/bin/kube-proxy
+
+        # Create required folders
+        sudo mkdir -p /etc/kubernetes/manifests/
+        sudo mkdir -p /etc/kubernetes/ssl/
+      fi
+
+  - path: /etc/kubernetes/ssl/worker-openssl.cnf
+    owner: root
+    permissions: 0755
+    content: |
+      [req]
+      req_extensions = v3_req
+      distinguished_name = req_distinguished_name
+      [req_distinguished_name]
+      [ v3_req ]
+      basicConstraints = CA:FALSE
+      keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+      subjectAltName = @alt_names
+      [alt_names]
+      IP.1 = $ENV::WORKER_IP
+
+  - path: /etc/kubernetes/ssl/generate-tls-keys.sh
+    owner: root
+    permissions: 0755
+    content: |
+      #! /usr/bin/bash
+      # Generates a set of TLS keys for this node to access the API server.
+      set -e
+
+      if [ ! -f /etc/kubernetes/ssl/worker.pem ]; then
+        echo "Generating TLS keys."
+        cd /etc/kubernetes/ssl
+        openssl genrsa -out worker-key.pem 2048
+        WORKER_IP=${1} openssl req -new -key worker-key.pem -out worker.csr -subj "/CN=worker" -config worker-openssl.cnf
+        WORKER_IP=${1} openssl x509 -req -in worker.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -out worker.pem -days 365 -extensions v3_req -extfile worker-openssl.cnf
+      fi
+
+      # Set permissions.
+      sudo chmod 600 /etc/kubernetes/ssl/worker-key.pem
+      sudo chown root:root /etc/kubernetes/ssl/worker-key.pem
+
+  - path: /etc/kubernetes/ssl/ca.pem
+    owner: core
+    permissions: 0644
+    content: |
+      -----BEGIN CERTIFICATE-----
+      -----END CERTIFICATE-----
+
+  - path: /etc/kubernetes/ssl/ca-key.pem
+    owner: core
+    permissions: 0644
+    content: |
+      -----BEGIN RSA PRIVATE KEY-----
+      -----END RSA PRIVATE KEY-----
+
+  - path: /etc/kubernetes/worker-kubeconfig.yaml
+    owner: root
+    permissions: 0755
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - name: local
+        cluster:
+          certificate-authority: /etc/kubernetes/ssl/ca.pem
+      users:
+      - name: kubelet
+        user:
+          client-certificate: /etc/kubernetes/ssl/worker.pem
+          client-key: /etc/kubernetes/ssl/worker-key.pem
+      contexts:
+      - context:
+          cluster: local
+          user: kubelet
+        name: kubelet-context
+      current-context: kubelet-context
+
+users:
+  - name: "lwolf"
+    groups:
+      - "sudo"
+      - "docker"
+    ssh_authorized_keys:
+      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCsgfsi2SeKwUmIeE5r09phQihsMTO0nbKTO2UXISmbmPrNxqp5Z+Zz4v2j8cHgjXiAwLBt1BAq1Z5/732UyUIroFDi7KAaXGREtiMxfU+HIwFPUyZtGaPWzx6T9a7kr7SCN47uQNJMPUEcrAYChW6PgGUhYw7xTnTVa7rLwnukovczcmCUTEYM82PGdKx8BMo5591X6YEiw3T1YSto1ETVe20EOhQRiyjtILFDnOGcGqCWde0bjsfW9H7URRS53kkYQo9acPJMDDva1q3BXFxjTWwtLBhGOeK1K8i0cYCtkSIkbS2Pq72vpYkbsnsdyZi86YwLjTUzwF1AVHR0qpGf sergey
+
+coreos:
+  etcd2:
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    initial-cluster: etcd01=http://10.10.30.11:2380,etcd02=http://10.10.30.12:2380,etcd03=http://10.10.30.13:2380
+    advertise-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    proxy: on
+  fleet:
+    public-ip: $public_ipv4
+    metadata: "role=minions"
+  locksmith:
+    endpoint: http://10.10.30.11:2379,http://10.10.30.12:2379,http://10.10.30.13:2379
+    group: "kube-minions"
+  flannel:
+    interface: $public_ipv4
+  units:
+    - name: etcd2.service
+      command: start
+    - name: fleet.service
+      command: start
+    - name: flanneld.service
+      command: start
+    - name: docker.service
+      command: start
+      drop-ins:
+        - name: 30-increase-ulimit.conf
+          content: |
+            [Service]
+            LimitMEMLOCK=infinity
+            TasksMax=infinity
+            LimitNPROC=infinity
+            LimitNOFILE=infinity
+#      command: restart
+    - name: flanneld.service
+      command: start
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Unit]
+            Requires=etcd2.service
+            [Service]
+            ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.3.0.0/16", "Backend": {"Type": "vxlan"}}'
+    - name: rpc-statd.service
+      command: start
+      enable: true
+    - name: kubernetes-install.service
+      runtime: true
+      command: start
+      content: |
+        [Unit]
+        Description=Installs Kubernetes tools
+        After=network-online.target
+        Requires=network-online.target
+
+        [Service]
+        ExecStart=/opt/bin/kubernetes-install.sh
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: generate-tls-keys.service
+      runtime: true
+      command: start
+      content: |
+        [Unit]
+        Description=Generates TLS keys for this node
+        After=setup-network-environment.service
+        Requires=setup-network-environment.service
+
+        [Service]
+        EnvironmentFile=/etc/network-environment
+        ExecStart=/etc/kubernetes/ssl/generate-tls-keys.sh ${DEFAULT_IPV4}
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: setup-network-environment.service
+      command: start
+      content: |
+        [Unit]
+        Description=Setup Network Environment
+        Documentation=https://github.com/kelseyhightower/setup-network-environment
+        Requires=network-online.target
+        After=network-online.target
+
+        [Service]
+        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/1.0.1/setup-network-environment
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
+        ExecStart=/opt/bin/setup-network-environment
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: kube-proxy.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Proxy
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=setup-network-environment.service
+        After=setup-network-environment.service
+
+        [Service]
+
+        # wait for kubernetes master to be up and ready
+        ExecStartPre=/opt/bin/wupiao 10.10.30.11:8080
+        ExecStart=/opt/bin/kube-proxy \
+        --master=https://10.10.30.11 \
+        --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
+        --proxy-mode=iptables
+        --bind-address=0.0.0.0 \
+        --logtostderr=true
+        Restart=always
+        RestartSec=10
+    - name: kube-kubelet.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Kubelet
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=setup-network-environment.service generate-tls-keys.service
+        After=setup-network-environment.service generate-tls-keys.service
+
+        [Service]
+        EnvironmentFile=/etc/network-environment
+        # wait for kubernetes master to be up and ready
+        ExecStartPre=/opt/bin/wupiao 10.10.30.11:8080
+        ExecStart=/opt/bin/kubelet \
+        --tls-cert-file=/etc/kubernetes/ssl/worker.pem \
+        --tls-private-key-file=/etc/kubernetes/ssl/worker-key.pem \
+        --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
+        --address=0.0.0.0 \
+        --port=10250 \
+        --hostname-override=${DEFAULT_IPV4} \
+        --api-servers=https://10.10.30.11,https://10.10.30.12,https://10.10.30.13 \
+        --cluster_dns=10.100.0.10 \
+        --cluster_domain=cluster.local \
+        --allow-privileged=true \
+        --logtostderr=true \
+        --cadvisor-port=4194 \
+        --healthz-bind-address=0.0.0.0 \
+        --healthz-port=10248
+        Restart=always
+        RestartSec=10
+    - name: vmware-tools.service
+      command: start
+      content: |
+        [Unit]
+        Description=VMWare Tools
+        After=systemd-networkd.service
+        [Service]
+        Restart=always
+        TimeoutStartSec=1200s
+        ExecStartPre=-/usr/bin/docker rm vmware-tools
+        ExecStart=/usr/bin/docker run --net=host --privileged --name vmware-tools sergeyzh/vmware-tools
+        ExecStop=-/usr/bin/docker stop vmware-tools
+        ExecStopPost=-/usr/bin/docker rm vmware-tools
+  update:
+    group: alpha
+    reboot-strategy: etcd-lock
+
