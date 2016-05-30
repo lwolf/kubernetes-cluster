@@ -127,6 +127,9 @@ coreos:
   fleet:
     public-ip: $public_ipv4
     metadata: "role=minions"
+    engine-reconcile-interval: 10
+    etcd-request-timeout: 5
+    agent-ttl: 120s
   locksmith:
     endpoint: http://10.10.30.11:2379,http://10.10.30.12:2379,http://10.10.30.13:2379
     group: "kube-minions"
